@@ -5,43 +5,57 @@ from typing import Literal
 from rich.console import Console
 from rich.table import Table
 
-# =============================================================================
-# Confidence type — only three valid values
-# =============================================================================
-Confidence = Literal["high", "medium", "low"]
+"""
+architecture
 
+data layer: store prefix rules and hex length rules
+    lookup tables
 
-# =============================================================================
-# Result type — what identify() returns for each guess
-# =============================================================================
+cli layer: this is main, render table and build argument parser
+    reads cmd argument
+    prints colored table
+    returns an exit code
+
+logic layer: identify hash type
+    decision making
+    takes a string, returns a list of hash candidate
+
+decision making
+    prefix rule?
+    special shape?
+    pure hex?
+    "$something$"?
+    shape hint?
+
+    give up
+"""
+Confidence = Literal["high","medium","low"]
 @dataclass(frozen = True, slots = True)
 class HashCandidate:
-    algorithm: str
+    algo: str
     confidence: Confidence
     reason: str
 
-
-# =============================================================================
-# Prefix rules — strongest signal we have
-# =============================================================================
-PREFIX_RULES: list[tuple[str, str, str]] = [
+#data layer
+#prefix
+PREFIX_RULE: list[tuple[str, str, str]] = [
     # Argon2 family
     ("$argon2id$", "Argon2id", "modern PHC string, the current standard"),
     ("$argon2i$", "Argon2i", "PHC string, side-channel-resistant variant"),
     ("$argon2d$", "Argon2d", "PHC string, GPU-resistant variant"),
 
-    # bcrypt and its many variants
+    # bcrypt
     ("$2y$", "bcrypt", "bcrypt PHC string, 2y variant (PHP)"),
     ("$2b$", "bcrypt", "bcrypt PHC string, 2b variant (current)"),
     ("$2a$", "bcrypt", "bcrypt PHC string, 2a variant (legacy)"),
     ("$2x$", "bcrypt", "bcrypt PHC string, 2x variant (legacy fix)"),
 
-    # Unix crypt(3) family
+    # Unix crypt(3)
     ("$6$", "SHA-512 crypt", "Unix crypt(3) using SHA-512 (default on Linux)"),
     ("$5$", "SHA-256 crypt", "Unix crypt(3) using SHA-256"),
     ("$1$", "MD5 crypt", "Unix crypt(3) using MD5 (legacy, weak)"),
 
-    # Apache htpasswd MD5 variant
+    # Apache htpasswd
     ("$apr1$", "Apache MD5-crypt", "Apache htpasswd MD5 variant (`htpasswd -m`)"),
 
     # yescrypt
@@ -54,16 +68,16 @@ PREFIX_RULES: list[tuple[str, str, str]] = [
     # Drupal 7
     ("$S$", "Drupal 7 (SHA-512)", "Drupal 7 PHC-style hash"),
 
-    # scrypt as some implementations encode it
+    # scrypt
     ("$7$", "scrypt", "scrypt PHC-style hash"),
 
-    # Django's default
+    # Django
     ("pbkdf2_sha256$", "Django PBKDF2-SHA256", "Django default password hash"),
     ("pbkdf2_sha1$", "Django PBKDF2-SHA1", "Django legacy password hash"),
     ("bcrypt_sha256$", "Django bcrypt-SHA256", "Django bcrypt wrapper"),
     ("argon2$", "Django Argon2", "Django Argon2 wrapper"),
 
-    # LDAP password schemes
+    # LDAP
     ("{SSHA}", "LDAP SSHA", "LDAP salted SHA-1 (base64 payload)"),
     ("{SHA}", "LDAP SHA", "LDAP SHA-1 (base64 payload)"),
     ("{SMD5}", "LDAP SMD5", "LDAP salted MD5 (base64 payload)"),
@@ -71,14 +85,10 @@ PREFIX_RULES: list[tuple[str, str, str]] = [
     ("{CRYPT}", "LDAP CRYPT", "LDAP wrapping a crypt(3) hash"),
 ]
 
-
-# =============================================================================
-# Length-and-hex rules — fallback when no prefix matched
-# =============================================================================
+#hex length 
 HEX_CHARSET: frozenset[str] = frozenset("0123456789abcdefABCDEF")
-_HEX_UPPER_CHARSET: frozenset[str] = frozenset("0123456789ABCDEF")
+HEX_UPPER_CHARSET: frozenset[str] = frozenset("0123456789ABCDEF")
 
-# Length-in-hex-chars → list of algorithms, ordered by commonality
 HEX_LENGTH_RULES: dict[int, list[str]] = {
     # 16 hex chars = 8 bytes = 64 bits
     16: ["MySQL323", "CRC-64"],
@@ -100,25 +110,59 @@ HEX_LENGTH_RULES: dict[int, list[str]] = {
     128: ["SHA-512", "SHA3-512", "BLAKE2b-512", "Whirlpool"],
 }
 
-
-# =============================================================================
-# Helpers
-# =============================================================================
-def _is_hex(text: str) -> bool:
-    return bool(text) and all(c in HEX_CHARSET for c in text)
+#some helper for logic layer
+def _is_hex(txt:str) -> bool:
+    return bool(txt) and all(c in HEX_CHARSET for c in txt)
 
 
+#special shape
+ #NetNTLMv2 layout:
+    #user :: domain : challenge : hmac(32 hex) : blob(>=32 hex)
+# NetNTLMv1 layout:
+    #user :: domain : lmhash(48 hex) : nthash(48 hex) : challenge
+def _is_NetNTLM(txt: str) -> HashCandidate:
+    if "::" in txt and txt.count(":") >=4:
+        parts = txt.split(":")
+        #["user", "", "domain", "challenge", "hmac", "blob"]
+        if (len(parts) >= 6 and len(parts[4]) == 32 and _is_hex(parts[4])):
+            return[
+                HashCandidate(
+                    algo = "NetNTLMv2",
+                    confidence = "high",
+                    reason = "user::domain:challenge:hmac(32 hex):blob shape",
+                )
+            ]
+
+        if (len(parts) >= 6 and len(parts[3]) == 48 and _is_hex(parts[3])):
+            return[
+                HashCandidate(
+                    algorithm = "NetNTLMv1",
+                    confidence = "high",
+                    reason = "user::domain:lmhash(48 hex):nthash(48 hex):challenge",
+                )
+            ]
+    return None
+
+#MySQL
 _MYSQL5_HEX_BODY_LENGTH = 40
 _MYSQL5_TOTAL_LENGTH = _MYSQL5_HEX_BODY_LENGTH + 1
 
-def _is_mysql5(text: str) -> bool:
-    if len(text) != _MYSQL5_TOTAL_LENGTH or not text.startswith("*"):
-        return False
-    body = text[1 :]
-    return all(c in _HEX_UPPER_CHARSET for c in body)
+def _is_mysql5(txt: str) -> HashCandidate:
+    if len(txt) != _MYSQL5_TOTAL_LENGTH or not txt.startswith("*"):
+        return None
+    body = txt[1:]
+    if all(c in HEX_UPPER_CHARSET for c in body):
+        return [
+            HashCandidate(
+                algo="MySQL5",
+                confidence="high",
+                reason="starts with `*` followed by 40 uppercase hex chars",
+            )
+        ]
+    
+    return None
 
-
-
+#descrypt
 _DESCRYPT_CHARSET: frozenset[str] = frozenset(
     "./0123456789"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -126,148 +170,106 @@ _DESCRYPT_CHARSET: frozenset[str] = frozenset(
 )
 _DESCRYPT_TOTAL_LENGTH = 13
 
-def _is_descrypt(text: str) -> bool:
-    return (
-        len(text) == _DESCRYPT_TOTAL_LENGTH
-        and all(c in _DESCRYPT_CHARSET for c in text)
-    )
+def _is_descrypt(txt: str) -> HashCandidate:
+    if len(txt) == _DESCRYPT_TOTAL_LENGTH and all(c in _DESCRYPT_CHARSET for c in txt):
+        return[
+            HashCandidate(
+                algo = "DES crypt",
+                confidence = "medium",
+                reason = "13 chars in `./0-9A-Za-z`"
+            )
+        ]
 
+#logic layer
 
-# =============================================================================
-# The actual identifier
-# =============================================================================
-# pylint: disable=too-many-return-statements,too-many-branches
-def identify(raw_input: str) -> list[HashCandidate]:
-    text = raw_input.strip()
+def identifier(raw_input: str) ->list[HashCandidate]:
+    txt = raw_input.strip()
 
-    if not text:
+    if not txt:
         return []
 
-    # ----- Step 1: prefix rules -----
-    for prefix, algorithm, note in PREFIX_RULES:
-        if text.startswith(prefix):
-            return [
+    #prefix?
+    for prefix, algor, note in PREFIX_RULE:
+        if txt.startswith(prefix):
+            return[
                 HashCandidate(
-                    algorithm = algorithm,
+                    algo = algor,
                     confidence = "high",
                     reason = f"prefix `{prefix}` — {note}",
                 )
             ]
 
-    # ----- Step 2: special non-PHC formats -----
-    if "::" in text and text.count(":") >= 4:
-        parts = text.split(":")
-        # NetNTLMv2 layout:
-        #   user :: domain : challenge : hmac(32 hex) : blob(>=32 hex)
-        if (len(parts) >= 6 and len(parts[4]) == 32 and _is_hex(parts[4])):
-            return [
-                HashCandidate(
-                    algorithm = "NetNTLMv2",
-                    confidence = "high",
-                    reason =
-                    "user::domain:challenge:hmac(32 hex):blob shape",
-                )
-            ]
-        # NetNTLMv1 layout:
-        #   user :: domain : lmhash(48 hex) : nthash(48 hex) : challenge
-        if (len(parts) >= 6 and len(parts[3]) == 48 and _is_hex(parts[3])):
-            return [
-                HashCandidate(
-                    algorithm = "NetNTLMv1",
-                    confidence = "high",
-                    reason =
-                    "user::domain:lm(48 hex):nt(48 hex):challenge shape",
-                )
-            ]
-
-    # MySQL5 — literal `*` + 40 uppercase hex chars
-    if _is_mysql5(text):
-        return [
-            HashCandidate(
-                algorithm = "MySQL5",
-                confidence = "high",
-                reason =
-                "starts with `*` followed by 40 uppercase hex chars",
-            )
-        ]
-
-    # Traditional 13-char DES crypt — legacy /etc/passwd format
-    # with no prefix at all. We report MEDIUM (not HIGH) because the
-    # 13-char `./0-9A-Za-z` shape isn't fully unique to DES crypt
-    if _is_descrypt(text):
-        return [
-            HashCandidate(
-                algorithm = "DES crypt",
-                confidence = "medium",
-                reason =
-                "13 chars in `./0-9A-Za-z` — legacy /etc/passwd format",
-            )
-        ]
-
-    # ----- Step 3: length + hex charset -----
-    if _is_hex(text):
-        algorithms = HEX_LENGTH_RULES.get(len(text), [])
+    #special shape?
+    #netNTLM
+    result = _is_NetNTLM(txt)
+    if result:
+        return result
+    #MySQL5
+    result = _is_mysql5(txt)
+    if result:
+        return result    
+    #DES crypt
+    result = _is_descrypt(txt)
+    if result:
+        return result  
+    
+    #pure hex?
+    if _is_hex(txt):
+        algorithms = HEX_LENGTH_RULES.get(len(txt), [])
         candidates: list[HashCandidate] = []
-        for index, algorithm in enumerate(algorithms):
-            # The first listed algorithm for each length is the modern
-            # default and gets MEDIUM confidence. The rest are still
-            # possible but less common in 2026 — LOW confidence
+        for index, algor in enumerate(algorithms):
             confidence: Confidence = "medium" if index == 0 else "low"
             label = (
                 "most likely candidate at this length"
-                if index == 0 else "also possible at this length"
-            )
+                if index == 0 else "also possible at this length")
             candidates.append(
                 HashCandidate(
-                    algorithm = algorithm,
+                    algo = algor,
                     confidence = confidence,
-                    reason = f"{len(text)} hex chars — {label}",
+                    reason = f"{len(txt)} hex chars — {label}",
                 )
             )
         return candidates
 
-    # ----- Step 4: generic PHC string fallback -----
-    if text.startswith("$"):
-        rest = text[1 :]
+    #"$something$"?
+    if txt.startswith("$"):
+        rest = txt[1:]
         if "$" in rest:
             algo_name = rest.split("$", 1)[0]
-            if algo_name and all(c.isalnum() or c in "-_"
-                                 for c in algo_name):
+            if algo_name and all(c.isalnum() or c in "-_" for c in algo_name):
                 return [
                     HashCandidate(
-                        algorithm = f"PHC string ({algo_name})",
+                        algo = f"PHC string ({algo_name})",
                         confidence = "low",
-                        reason =
-                        f"`${algo_name}$...` shape — generic PHC, no specific rule",
+                        reason = f"`${algo_name}$...` shape — generic PHC, no specific rule",
                     )
                 ]
 
-    # ----- Step 5: not-a-hash shape hints -----
-    if text.startswith("eyJ"):
+    #shape hint?
+    if txt.startswith("eyJ"):
+        # JWTs always begin with `eyJ`
         return [
             HashCandidate(
-                algorithm = "JWT (not a hash)",
+                algo = "JWT (not a hash)",
                 confidence = "low",
-                reason =
-                "leading `eyJ` is base64 of `{\"` — JWT, not a hash",
+                reason = "leading `eyJ` is base64 of `{\"` — JWT, not a hash",
             )
         ]
-    if any(c in text for c in "+/=") and len(text) > 8:
+    if any(c in txt for c in "+/=") and len(txt) > 8:
+        # Hex hashes NEVER contain `+`, `/`, or `=`
         return [
             HashCandidate(
-                algorithm = "Base64 blob (not a hash)",
+                algo = "Base64 blob (not a hash)",
                 confidence = "low",
                 reason = "contains base64-only chars (`+`, `/`, `=`)",
             )
         ]
 
-    # ----- Step 6: nothing matched -----
-    return []
+    return[]
 
+#cli layer
 
-# =============================================================================
-# CLI — argparse + a rich table
-# =============================================================================
+#build argument
 def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog = "hashid",
@@ -290,12 +292,13 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     return parser
 
-
+#print table 
 def _render_table(
     raw_input: str,
     candidates: list[HashCandidate],
     console: Console,
 ) -> None:
+
     table = Table(
         title = f"Candidates for: {raw_input.strip()}",
         title_style = "bold cyan",
@@ -314,19 +317,20 @@ def _render_table(
     for candidate in candidates:
         color = confidence_colors[candidate.confidence]
         table.add_row(
-            candidate.algorithm,
+            candidate.algo,
             f"[{color}]{candidate.confidence}[/{color}]",
             candidate.reason,
         )
     console.print(table)
 
 
+#main
 def main() -> int:
     parser = _build_argument_parser()
     args = parser.parse_args()
     console = Console()
 
-    candidates = identify(args.hash)
+    candidates = identifier(args.hash)
 
     if not candidates:
         console.print(
